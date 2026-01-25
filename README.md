@@ -130,6 +130,24 @@ HEARTMULA_COMPILE=true HEARTMULA_COMPILE_MODE=max-autotune python -m uvicorn bac
 
 > **Note:** First generation will be slower due to compilation. Subsequent generations benefit from the compiled kernels.
 
+### 🔥 torch.compile for MacOS (Experimental)
+First, you need to install triton in your python environment (pip install triton-metal does't work):
+```
+source venv/bin/activate
+git clone https://github.com/triton-lang/triton.git
+cd triton
+pip install -e .
+```
+After install you will see something like: 
+```
+Successfully built triton
+Installing collected packages: triton
+Successfully installed triton-3.6.0+git88c622b3
+```
+Now, run backend with variable HEARTMULA_COMPILE=true
+```
+HEARTMULA_COMPILE=true HEARTMULA_COMPILE_MODE=max-autotune python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+```
 ### 🎯 Smart Multi-GPU Detection
 Automatically selects the best GPU configuration:
 - **With 4-bit quantization**: Prioritizes fastest GPU (highest compute capability)
@@ -286,12 +304,6 @@ python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Install backend dependencies
-pip install -r backend/requirements.txt
-```
-For MacOS M-based(Silicon) use:
-```
-python3.10 -m venv venv
-source venv/bin/activate
 pip install -r backend/requirements.txt
 ```
 > **Note:** HeartLib models (~5GB) will be downloaded automatically from HuggingFace on first run.
