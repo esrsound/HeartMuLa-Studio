@@ -28,22 +28,82 @@ SUPPORTED_LANGUAGES = [
     "Swedish", "Danish", "Norwegian", "Finnish", "Greek", "Hebrew", "Thai", "Vietnamese"
 ]
 
-# OpenRouter API Key (set via environment variable or .env file)
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+# Default values from environment (can be overridden by settings)
+_DEFAULT_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+_DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+_DEFAULT_CUSTOM_API_BASE_URL = os.environ.get("CUSTOM_API_BASE_URL", "")
+_DEFAULT_CUSTOM_API_KEY = os.environ.get("CUSTOM_API_KEY", "")
+_DEFAULT_CUSTOM_API_MODEL = os.environ.get("CUSTOM_API_MODEL", "")
 
 class LLMService:
-    # Ollama URL - configurable for Docker (use host.docker.internal to reach host)
-    OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    # Configurable settings (can be updated at runtime)
+    OLLAMA_BASE_URL = _DEFAULT_OLLAMA_HOST
+    OPENROUTER_API_KEY = _DEFAULT_OPENROUTER_KEY
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+    # Custom API settings (OpenAI-compatible endpoints like vLLM, LocalAI, LM Studio)
+    CUSTOM_API_BASE_URL = _DEFAULT_CUSTOM_API_BASE_URL
+    CUSTOM_API_KEY = _DEFAULT_CUSTOM_API_KEY
+    CUSTOM_API_MODEL = _DEFAULT_CUSTOM_API_MODEL
 
-    @staticmethod
-    def get_models() -> List[dict]:
+    @classmethod
+    def update_settings(cls, ollama_host: str = None, openrouter_api_key: str = None,
+                       custom_api_base_url: str = None, custom_api_key: str = None,
+                       custom_api_model: str = None):
+        """Update LLM service settings at runtime."""
+        if ollama_host is not None:
+            cls.OLLAMA_BASE_URL = ollama_host if ollama_host else _DEFAULT_OLLAMA_HOST
+            logger.info(f"[LLM] Updated Ollama host: {cls.OLLAMA_BASE_URL}")
+        if openrouter_api_key is not None:
+            cls.OPENROUTER_API_KEY = openrouter_api_key
+            logger.info(f"[LLM] Updated OpenRouter API key: {'***' + openrouter_api_key[-4:] if openrouter_api_key else '(empty)'}")
+        if custom_api_base_url is not None:
+            cls.CUSTOM_API_BASE_URL = custom_api_base_url
+            logger.info(f"[LLM] Updated Custom API base URL: {cls.CUSTOM_API_BASE_URL or '(empty)'}")
+        if custom_api_key is not None:
+            cls.CUSTOM_API_KEY = custom_api_key
+            logger.info(f"[LLM] Updated Custom API key: {'***' + custom_api_key[-4:] if custom_api_key else '(empty)'}")
+        if custom_api_model is not None:
+            cls.CUSTOM_API_MODEL = custom_api_model
+            logger.info(f"[LLM] Updated Custom API model: {cls.CUSTOM_API_MODEL or '(empty)'}")
+
+    @classmethod
+    def get_settings(cls) -> dict:
+        """Get current LLM service settings."""
+        return {
+            "ollama_host": cls.OLLAMA_BASE_URL,
+            "openrouter_api_key": cls.OPENROUTER_API_KEY,
+            "custom_api_base_url": cls.CUSTOM_API_BASE_URL,
+            "custom_api_key": cls.CUSTOM_API_KEY,
+            "custom_api_model": cls.CUSTOM_API_MODEL
+        }
+
+    @classmethod
+    def check_ollama_available(cls) -> bool:
+        """Check if Ollama is available."""
+        try:
+            resp = requests.get(f"{cls.OLLAMA_BASE_URL}/api/tags", timeout=2)
+            return resp.status_code == 200
+        except:
+            return False
+
+    @classmethod
+    def check_openrouter_available(cls) -> bool:
+        """Check if OpenRouter API key is set."""
+        return bool(cls.OPENROUTER_API_KEY)
+
+    @classmethod
+    def check_custom_api_available(cls) -> bool:
+        """Check if Custom API is configured (base URL and model are required)."""
+        return bool(cls.CUSTOM_API_BASE_URL and cls.CUSTOM_API_MODEL)
+
+    @classmethod
+    def get_models(cls) -> List[dict]:
         """Returns available models from both Ollama and OpenRouter."""
         models = []
 
         # Try Ollama first
         try:
-            resp = requests.get(f"{LLMService.OLLAMA_BASE_URL}/api/tags", timeout=2)
+            resp = requests.get(f"{cls.OLLAMA_BASE_URL}/api/tags", timeout=2)
             if resp.status_code == 200:
                 data = resp.json()
                 for model in data.get("models", []):
@@ -56,7 +116,7 @@ class LLMService:
             logger.warning(f"Failed to fetch Ollama models: {e}")
 
         # Add OpenRouter models if API key is set
-        if OPENROUTER_API_KEY:
+        if cls.OPENROUTER_API_KEY:
             openrouter_models = [
                 {"id": "google/gemini-2.0-flash-001", "name": "Gemini 2.0 Flash", "provider": "openrouter"},
                 {"id": "anthropic/claude-3.5-sonnet", "name": "Claude 3.5 Sonnet", "provider": "openrouter"},
@@ -65,14 +125,22 @@ class LLMService:
             ]
             models.extend(openrouter_models)
 
+        # Add Custom API model if configured
+        if cls.CUSTOM_API_BASE_URL and cls.CUSTOM_API_MODEL:
+            models.append({
+                "id": cls.CUSTOM_API_MODEL,
+                "name": f"Custom: {cls.CUSTOM_API_MODEL}",
+                "provider": "custom"
+            })
+
         return models
 
     @staticmethod
     def get_supported_languages() -> List[str]:
         return SUPPORTED_LANGUAGES
 
-    @staticmethod
-    def _call_ollama(model: str, prompt: str, json_mode: bool = False, temperature: float = 0.7) -> str:
+    @classmethod
+    def _call_ollama(cls, model: str, prompt: str, json_mode: bool = False, temperature: float = 0.7) -> str:
         """Call Ollama API."""
         payload = {
             "model": model,
@@ -84,7 +152,7 @@ class LLMService:
             payload["format"] = "json"
 
         resp = requests.post(
-            f"{LLMService.OLLAMA_BASE_URL}/api/generate",
+            f"{cls.OLLAMA_BASE_URL}/api/generate",
             json=payload,
             timeout=60
         )
@@ -92,11 +160,11 @@ class LLMService:
             return resp.json().get("response", "")
         raise Exception(f"Ollama Error: {resp.text}")
 
-    @staticmethod
-    def _call_openrouter(model: str, prompt: str, temperature: float = 0.7) -> str:
+    @classmethod
+    def _call_openrouter(cls, model: str, prompt: str, temperature: float = 0.7) -> str:
         """Call OpenRouter API."""
         headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {cls.OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
             "HTTP-Referer": "http://localhost:5173",
             "X-Title": "HeartMuLa Music"
@@ -120,13 +188,43 @@ class LLMService:
             return data["choices"][0]["message"]["content"]
         raise Exception(f"OpenRouter Error: {resp.status_code} - {resp.text}")
 
-    @staticmethod
-    def _call_llm(model: str, prompt: str, provider: str = "ollama", json_mode: bool = False, temperature: float = 0.7) -> str:
+    @classmethod
+    def _call_custom_api(cls, model: str, prompt: str, temperature: float = 0.7) -> str:
+        """Call a custom OpenAI-compatible API (vLLM, LocalAI, LM Studio, etc.)."""
+        headers = {"Content-Type": "application/json"}
+        if cls.CUSTOM_API_KEY:
+            headers["Authorization"] = f"Bearer {cls.CUSTOM_API_KEY}"
+
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature
+        }
+
+        # Ensure base URL doesn't have trailing slash
+        base_url = cls.CUSTOM_API_BASE_URL.rstrip('/')
+
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        raise Exception(f"Custom API Error: {resp.status_code} - {resp.text}")
+
+    @classmethod
+    def _call_llm(cls, model: str, prompt: str, provider: str = "ollama", json_mode: bool = False, temperature: float = 0.7) -> str:
         """Unified LLM call that routes to appropriate provider."""
         if provider == "openrouter":
-            return LLMService._call_openrouter(model, prompt, temperature)
+            return cls._call_openrouter(model, prompt, temperature)
+        elif provider == "custom":
+            return cls._call_custom_api(model, prompt, temperature)
         else:
-            return LLMService._call_ollama(model, prompt, json_mode, temperature)
+            return cls._call_ollama(model, prompt, json_mode, temperature)
 
     @staticmethod
     def generate_lyrics(topic: str, model: str = "llama3", seed_lyrics: Optional[str] = None,

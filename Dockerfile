@@ -32,10 +32,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
     python3.11-venv \
+    python3.11-dev \
     python3-pip \
     git \
     ffmpeg \
     libsndfile1 \
+    gcc \
+    g++ \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
@@ -51,11 +54,21 @@ RUN useradd -m -u 1000 heartmula && \
 # Copy backend requirements first for better caching
 COPY --chown=heartmula:heartmula backend/requirements.txt /app/backend/
 
-# Install Python dependencies
-RUN pip3 install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 && \
-    pip3 install --no-cache-dir -r /app/backend/requirements.txt && \
-    pip3 install --no-cache-dir bitsandbytes accelerate
+# Install Python dependencies in separate layers for smaller Docker Hub uploads
+# Layer 1: pip upgrade
+RUN pip3 install --no-cache-dir --upgrade pip
+
+# Layer 2: PyTorch (largest dependency ~800MB)
+RUN pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
+
+# Layer 3: torchvision and torchaudio
+RUN pip3 install --no-cache-dir torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Layer 4: Other requirements
+RUN pip3 install --no-cache-dir -r /app/backend/requirements.txt
+
+# Layer 5: bitsandbytes and accelerate
+RUN pip3 install --no-cache-dir bitsandbytes accelerate
 
 # Copy backend code
 COPY --chown=heartmula:heartmula backend/ /app/backend/
@@ -71,7 +84,8 @@ ENV PYTHONUNBUFFERED=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     HEARTMULA_4BIT=auto \
     HEARTMULA_SEQUENTIAL_OFFLOAD=auto \
-    HF_HOME=/app/backend/models
+    HF_HOME=/app/backend/models \
+    TORCHINDUCTOR_CACHE_DIR=/app/backend/models/.torch_cache
 
 # Expose port
 EXPOSE 8000

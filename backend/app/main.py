@@ -17,7 +17,9 @@ from uuid import UUID
 
 from backend.app.models import (
     Job, JobStatus, GenerationRequest, LyricsRequest, EnhancePromptRequest, InspirationRequest,
-    LikedSong, Playlist, PlaylistSong, CreatePlaylistRequest, UpdatePlaylistRequest, AddToPlaylistRequest
+    LikedSong, Playlist, PlaylistSong, CreatePlaylistRequest, UpdatePlaylistRequest, AddToPlaylistRequest,
+    GPUSettingsRequest, GPUSettingsResponse, GPUStatusResponse, StartupStatusResponse, ModelReloadResponse,
+    LLMSettingsRequest, LLMSettingsResponse
 )
 from backend.app.services.music_service import music_service
 from backend.app.services.llm_service import LLMService
@@ -49,10 +51,9 @@ def run_migrations():
 async def lifespan(app: FastAPI):
     create_db_and_tables()
     run_migrations()
-    # Initialize Heartlib (Non-blocking usually, but loading big models might take a sec)
-    # We trigger it but don't await strictly if we want faster startup, 
-    # but for safety we await to ensure model is ready before traffic.
-    await music_service.initialize() 
+    # Start model initialization in background - server starts immediately
+    # Frontend can connect and show progress via SSE
+    asyncio.create_task(music_service.initialize_with_progress())
     yield
     # Shutdown Event Manager (Closes SSE connections)
     event_manager.shutdown()
@@ -575,6 +576,145 @@ def remove_song_from_playlist(playlist_id: UUID, job_id: UUID):
         session.commit()
 
         return {"status": "removed", "playlist_id": str(playlist_id), "job_id": str(job_id)}
+
+
+# ============== SETTINGS & STARTUP STATUS ==============
+
+@app.get("/settings/startup/status", response_model=StartupStatusResponse)
+def get_startup_status():
+    """Get current startup/initialization status."""
+    return music_service.get_startup_status()
+
+
+@app.get("/settings/gpu/status", response_model=GPUStatusResponse)
+def get_gpu_status():
+    """Get GPU hardware information."""
+    return music_service.get_gpu_info()
+
+
+@app.get("/settings/gpu", response_model=GPUSettingsResponse)
+def get_gpu_settings():
+    """Get current GPU settings."""
+    return music_service.current_settings
+
+
+@app.put("/settings/gpu", response_model=GPUSettingsResponse)
+def update_gpu_settings(settings: GPUSettingsRequest):
+    """Update GPU settings (does not reload models)."""
+    if settings.quantization_4bit is not None:
+        music_service.current_settings["quantization_4bit"] = settings.quantization_4bit
+    if settings.sequential_offload is not None:
+        music_service.current_settings["sequential_offload"] = settings.sequential_offload
+    if settings.torch_compile is not None:
+        music_service.current_settings["torch_compile"] = settings.torch_compile
+    if settings.torch_compile_mode is not None:
+        music_service.current_settings["torch_compile_mode"] = settings.torch_compile_mode
+    # Persist settings to disk
+    music_service._save_settings()
+    return music_service.current_settings
+
+
+@app.post("/settings/gpu/reload", response_model=ModelReloadResponse)
+async def reload_models(settings: GPUSettingsRequest, background_tasks: BackgroundTasks):
+    """Reload models with new settings."""
+    # Check if models are currently loading
+    if music_service.is_loading:
+        raise HTTPException(status_code=409, detail="Models are currently loading")
+
+    # Check if a job is processing
+    if len(music_service.active_jobs) > 0:
+        raise HTTPException(status_code=409, detail="Cannot reload while a job is processing")
+
+    if len(music_service.job_queue) > 0:
+        raise HTTPException(status_code=409, detail="Cannot reload while jobs are queued")
+
+    # Convert settings to dict
+    new_settings = {}
+    if settings.quantization_4bit is not None:
+        new_settings["quantization_4bit"] = settings.quantization_4bit
+    if settings.sequential_offload is not None:
+        new_settings["sequential_offload"] = settings.sequential_offload
+    if settings.torch_compile is not None:
+        new_settings["torch_compile"] = settings.torch_compile
+    if settings.torch_compile_mode is not None:
+        new_settings["torch_compile_mode"] = settings.torch_compile_mode
+
+    # Start reload in background
+    background_tasks.add_task(music_service.reload_models, new_settings)
+
+    return {"status": "reloading", "message": "Model reload started"}
+
+
+# ============== LLM SETTINGS ==============
+
+@app.get("/settings/llm", response_model=LLMSettingsResponse)
+def get_llm_settings():
+    """Get current LLM provider settings."""
+    settings = LLMService.get_settings()
+    # Mask API keys for security (show only last 4 chars)
+    openrouter_key = settings.get("openrouter_api_key", "")
+    masked_openrouter_key = f"***{openrouter_key[-4:]}" if openrouter_key and len(openrouter_key) > 4 else ""
+
+    custom_api_key = settings.get("custom_api_key", "")
+    masked_custom_key = f"***{custom_api_key[-4:]}" if custom_api_key and len(custom_api_key) > 4 else ""
+
+    return {
+        "ollama_host": settings.get("ollama_host", ""),
+        "openrouter_api_key": masked_openrouter_key,
+        "ollama_available": LLMService.check_ollama_available(),
+        "openrouter_available": LLMService.check_openrouter_available(),
+        "custom_api_base_url": settings.get("custom_api_base_url", ""),
+        "custom_api_key": masked_custom_key,
+        "custom_api_model": settings.get("custom_api_model", ""),
+        "custom_api_available": LLMService.check_custom_api_available()
+    }
+
+
+@app.put("/settings/llm", response_model=LLMSettingsResponse)
+def update_llm_settings(settings: LLMSettingsRequest):
+    """Update LLM provider settings."""
+    # Update LLMService settings
+    if settings.ollama_host is not None:
+        LLMService.update_settings(ollama_host=settings.ollama_host)
+        music_service.current_settings["ollama_host"] = settings.ollama_host
+
+    if settings.openrouter_api_key is not None:
+        LLMService.update_settings(openrouter_api_key=settings.openrouter_api_key)
+        music_service.current_settings["openrouter_api_key"] = settings.openrouter_api_key
+
+    if settings.custom_api_base_url is not None:
+        LLMService.update_settings(custom_api_base_url=settings.custom_api_base_url)
+        music_service.current_settings["custom_api_base_url"] = settings.custom_api_base_url
+
+    if settings.custom_api_key is not None:
+        LLMService.update_settings(custom_api_key=settings.custom_api_key)
+        music_service.current_settings["custom_api_key"] = settings.custom_api_key
+
+    if settings.custom_api_model is not None:
+        LLMService.update_settings(custom_api_model=settings.custom_api_model)
+        music_service.current_settings["custom_api_model"] = settings.custom_api_model
+
+    # Save to persistent storage
+    music_service._save_settings()
+
+    # Return updated settings
+    current = LLMService.get_settings()
+    openrouter_key = current.get("openrouter_api_key", "")
+    masked_openrouter_key = f"***{openrouter_key[-4:]}" if openrouter_key and len(openrouter_key) > 4 else ""
+
+    custom_api_key = current.get("custom_api_key", "")
+    masked_custom_key = f"***{custom_api_key[-4:]}" if custom_api_key and len(custom_api_key) > 4 else ""
+
+    return {
+        "ollama_host": current.get("ollama_host", ""),
+        "openrouter_api_key": masked_openrouter_key,
+        "ollama_available": LLMService.check_ollama_available(),
+        "openrouter_available": LLMService.check_openrouter_available(),
+        "custom_api_base_url": current.get("custom_api_base_url", ""),
+        "custom_api_key": masked_custom_key,
+        "custom_api_model": current.get("custom_api_model", ""),
+        "custom_api_available": LLMService.check_custom_api_available()
+    }
 
 
 # ============== FRONTEND STATIC FILES (Docker Production) ==============

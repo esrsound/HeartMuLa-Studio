@@ -62,11 +62,12 @@ interface HistoryFeedProps {
     onAddToPlaylist?: (job: Job) => void;
     onSelectTrack?: (job: Job) => void;
     selectedTrackId?: string;
+    onDeleteJob?: (jobId: string) => void;
 }
 
 const ITEMS_PER_PAGE = 100;
 
-export const HistoryFeed: React.FC<HistoryFeedProps> = ({ history, currentJobId, onRefresh, onExtend, onReimport, onRetry, onPlayTrack, onPauseTrack, playingTrackId, isTrackPlaying = false, queuedJobs, darkMode = false, likedIds = new Set(), onToggleLike, onAddToPlaylist, onSelectTrack, selectedTrackId }) => {
+export const HistoryFeed: React.FC<HistoryFeedProps> = ({ history, currentJobId, onRefresh, onExtend, onReimport, onRetry, onPlayTrack, onPauseTrack, playingTrackId, isTrackPlaying = false, queuedJobs, darkMode = false, likedIds = new Set(), onToggleLike, onAddToPlaylist, onSelectTrack, selectedTrackId, onDeleteJob }) => {
     const scrollRef = useRef<HTMLDivElement>(null);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [tempTitle, setTempTitle] = useState("");
@@ -192,6 +193,7 @@ export const HistoryFeed: React.FC<HistoryFeedProps> = ({ history, currentJobId,
         if (!confirm("Are you sure you want to delete this track? This action cannot be undone.")) return;
         try {
             await api.deleteJob(jobId);
+            onDeleteJob?.(jobId); // Update queue state
             onRefresh();
         } catch (e) {
             console.error("Delete failed", e);
