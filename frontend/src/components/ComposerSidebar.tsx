@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronDown, ChevronUp, Sparkles, RotateCcw, Wand2, ArrowRightCircle, RefreshCw, Clock, Sliders, Music, Upload, X, FileAudio, Play, Dices, Copy, Scissors, Timer } from 'lucide-react';
+import { ChevronDown, ChevronUp, Sparkles, RotateCcw, Wand2, ArrowRightCircle, RefreshCw, Clock, Sliders, Music, Upload, X, FileAudio, Play, Dices, Copy, Scissors, Timer, Type } from 'lucide-react';
 
 import { api, type Job, type LLMModel } from '../api';
 import { RefAudioRegionModal } from './RefAudioRegionModal';
@@ -47,6 +47,8 @@ export interface CompositionData {
     negativeTags?: string;
     refAudioAsNoise?: boolean;
     refAudioNoiseStrength?: number;
+    // User-defined title
+    title?: string;
 }
 
 export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
@@ -74,6 +76,8 @@ export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
     const [topic, setTopic] = useState('');
     const [style, setStyle] = useState('');
     const [lyrics, setLyrics] = useState('');
+    const [title, setTitle] = useState('');
+    const [useCustomTitle, setUseCustomTitle] = useState(false);
     const [showAdvanced, setShowAdvanced] = useState(() => localStorage.getItem('heartmula_show_advanced') === 'true');
     const [logs, setLogs] = useState<string[]>([]);
     const [isEnhancing, setIsEnhancing] = useState(false);
@@ -161,6 +165,10 @@ export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
             const data = e.detail;
             if (data.msg) {
                 setLogs(prev => {
+                    // Don't add duplicate consecutive messages
+                    if (prev.length > 0 && prev[prev.length - 1] === data.msg) {
+                        return prev;
+                    }
                     const newLogs = [...prev, `${data.msg}`];
                     return newLogs.slice(-4);
                 });
@@ -314,6 +322,8 @@ export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
                 negativeTags: negativeTags.trim() || undefined,
                 refAudioAsNoise: refAudio && refAudioAsNoise ? true : undefined,
                 refAudioNoiseStrength: refAudio && refAudioAsNoise ? refAudioNoiseStrength : undefined,
+                // User-defined title (only if custom title mode is enabled and title is set)
+                title: useCustomTitle && title.trim() ? title.trim() : undefined,
             });
         }
         // Reset count after generating
@@ -321,7 +331,8 @@ export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
     };
 
     const handleReset = () => {
-        setTopic(''); setLyrics(''); setStyle(''); setDuration(30);
+        setTopic(''); setLyrics(''); setStyle(''); setTitle(''); setDuration(30);
+        setUseCustomTitle(false);
         // Don't reset seed - user should toggle to Random explicitly
         if (refAudio) handleRemoveRefAudio();
     };
@@ -460,6 +471,63 @@ export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
                                 )}
                             </button>
                         </div>
+                    </div>
+
+                    {/* Song Title */}
+                    <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
+                            <label className={`text-xs font-medium ${darkMode ? 'text-[#b3b3b3]' : 'text-slate-600'}`}>
+                                Song Title
+                            </label>
+                            <button
+                                onClick={() => setUseCustomTitle(!useCustomTitle)}
+                                className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded-full transition-colors ${
+                                    useCustomTitle
+                                        ? darkMode
+                                            ? 'bg-[#1DB954]/20 text-[#1DB954]'
+                                            : 'bg-cyan-100 text-cyan-600'
+                                        : darkMode
+                                            ? 'bg-[#282828] text-[#606060] hover:text-[#b3b3b3]'
+                                            : 'bg-slate-100 text-slate-400 hover:text-slate-600'
+                                }`}
+                            >
+                                <Type className="w-3 h-3" />
+                                Custom
+                            </button>
+                        </div>
+                        <AnimatePresence mode="wait">
+                            {useCustomTitle ? (
+                                <motion.input
+                                    key="custom-title"
+                                    initial={{ opacity: 0, y: -10 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0, y: -10 }}
+                                    value={title}
+                                    onChange={(e) => setTitle(e.target.value)}
+                                    placeholder="Enter your song title..."
+                                    className={`w-full text-sm px-3 py-2.5 rounded-md border transition-colors ${
+                                        darkMode
+                                            ? 'bg-[#282828] border-[#404040] text-white placeholder:text-[#606060] focus:border-[#1DB954]'
+                                            : 'bg-white border-slate-200 text-slate-800 placeholder:text-slate-400 focus:border-cyan-500'
+                                    } focus:outline-none`}
+                                />
+                            ) : (
+                                <motion.div
+                                    key="auto-title"
+                                    initial={{ opacity: 0, y: 10 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0, y: 10 }}
+                                    className={`flex items-center gap-2 py-2.5 px-3 rounded-md border border-dashed ${
+                                        darkMode
+                                            ? 'bg-[#282828]/50 border-[#404040] text-[#606060]'
+                                            : 'bg-slate-50 border-slate-200 text-slate-400'
+                                    }`}
+                                >
+                                    <Wand2 className="w-4 h-4" />
+                                    <span className="text-sm">Auto-generated from lyrics</span>
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
                     </div>
 
                     {/* Musical Style */}

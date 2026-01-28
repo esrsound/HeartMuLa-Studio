@@ -35,6 +35,7 @@ class GenerationRequest(SQLModel):
     tags: Optional[str] = None
     seed: Optional[int] = None # Added for Seed Consistency
     llm_model: Optional[str] = None # specific LLM usage for title/lyrics
+    title: Optional[str] = None # User-provided title (skips LLM title generation)
     parent_job_id: Optional[str] = None # For Track Extension (Phase 9)
     ref_audio_id: Optional[str] = None # Reference audio file ID for style conditioning
     style_influence: float = 100.0 # Style influence (0-100%, controls muq_segment_sec)
@@ -103,3 +104,68 @@ class UpdatePlaylistRequest(SQLModel):
 
 class AddToPlaylistRequest(SQLModel):
     job_id: str
+
+
+# ============== Settings Models ==============
+
+class GPUInfo(SQLModel):
+    index: int
+    name: str
+    vram_gb: float
+    compute_capability: float
+    supports_flash_attention: bool
+
+
+class GPUStatusResponse(SQLModel):
+    cuda_available: bool
+    num_gpus: int
+    gpus: list
+    total_vram_gb: float
+
+
+class GPUSettingsRequest(SQLModel):
+    quantization_4bit: Optional[str] = None  # "auto", "true", "false"
+    sequential_offload: Optional[str] = None  # "auto", "true", "false"
+    torch_compile: Optional[bool] = None
+    torch_compile_mode: Optional[str] = None  # "default", "reduce-overhead", "max-autotune"
+
+
+class GPUSettingsResponse(SQLModel):
+    quantization_4bit: str
+    sequential_offload: str
+    torch_compile: bool
+    torch_compile_mode: str
+
+
+class StartupStatusResponse(SQLModel):
+    status: str  # "not_started", "downloading", "loading", "ready", "error"
+    progress: int
+    message: str
+    error: Optional[str] = None
+    ready: bool
+
+
+class ModelReloadResponse(SQLModel):
+    status: str
+    message: str
+
+
+# ============== LLM Settings Models ==============
+
+class LLMSettingsRequest(SQLModel):
+    ollama_host: Optional[str] = None
+    openrouter_api_key: Optional[str] = None
+    custom_api_base_url: Optional[str] = None
+    custom_api_key: Optional[str] = None
+    custom_api_model: Optional[str] = None
+
+
+class LLMSettingsResponse(SQLModel):
+    ollama_host: str
+    openrouter_api_key: str  # Will be masked in response
+    ollama_available: bool
+    openrouter_available: bool
+    custom_api_base_url: str
+    custom_api_key: str  # Will be masked in response
+    custom_api_model: str
+    custom_api_available: bool

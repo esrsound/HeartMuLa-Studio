@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { api, type LLMModel } from './api';
+import { api, type LLMModel, type StartupStatus, type GPUStatus, type GPUSettings, type LLMSettings } from './api';
 import type { Job } from './api';
 import { ComposerSidebar } from './components/ComposerSidebar';
 import type { CompositionData } from './components/ComposerSidebar';
@@ -8,7 +8,9 @@ import { BottomPlayer, type PreviewAudio, type PreviewPlaybackState } from './co
 import { TrackDetailsSidebar } from './components/TrackDetailsSidebar';
 import { LibrarySidebar } from './components/LibrarySidebar';
 import { AddToPlaylistModal } from './components/AddToPlaylistModal';
-import { Moon, Sun, PanelRightOpen, PanelLeftClose, PanelLeftOpen, Heart, ListMusic, Home, Plus, X } from 'lucide-react';
+import { StartupScreen } from './components/StartupScreen';
+import { SettingsModal } from './components/SettingsModal';
+import { Moon, Sun, PanelRightOpen, PanelLeftClose, PanelLeftOpen, Heart, ListMusic, Home, Plus, X, Settings } from 'lucide-react';
 import { HeartMuLaLogo } from './components/HeartMuLaLogo';
 
 type ActiveSection = 'home' | 'favourites' | 'playlists';
@@ -48,6 +50,14 @@ function App() {
   const [previewSeekTo, setPreviewSeekTo] = useState<number | undefined>(undefined);
   const [previewPlayPauseTrigger, setPreviewPlayPauseTrigger] = useState(0);
 
+  // Startup and settings state
+  const [startupStatus, setStartupStatus] = useState<StartupStatus | null>(null);
+  const [isStartupComplete, setIsStartupComplete] = useState(false);
+  const [gpuStatus, setGpuStatus] = useState<GPUStatus | null>(null);
+  const [gpuSettings, setGpuSettings] = useState<GPUSettings | null>(null);
+  const [llmSettings, setLlmSettings] = useState<LLMSettings | null>(null);
+  const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+
   // Handler for previewing reference audio in the bottom player
   const handlePreviewRefAudio = (url: string, filename: string) => {
     setPreviewAudio({
@@ -80,6 +90,40 @@ function App() {
     }
     localStorage.setItem('heartmula_dark_mode', darkMode.toString());
   }, [darkMode]);
+
+  // Check startup status on initial load
+  useEffect(() => {
+    const checkStartupStatus = async () => {
+      try {
+        const status = await api.getStartupStatus();
+        setStartupStatus(status);
+        if (status.ready) {
+          setIsStartupComplete(true);
+        }
+      } catch (e) {
+        // Server not ready yet, will get status via SSE
+        console.log("Waiting for server...");
+      }
+    };
+
+    const loadGpuInfo = async () => {
+      try {
+        const [status, settings, llm] = await Promise.all([
+          api.getGPUStatus(),
+          api.getGPUSettings(),
+          api.getLLMSettings()
+        ]);
+        setGpuStatus(status);
+        setGpuSettings(settings);
+        setLlmSettings(llm);
+      } catch (e) {
+        console.log("Settings not available yet");
+      }
+    };
+
+    checkStartupStatus();
+    loadGpuInfo();
+  }, []);
 
   // Update sidebar when playing track changes (desktop only)
   useEffect(() => {
@@ -208,6 +252,17 @@ function App() {
         if (type === 'job_progress') {
           window.dispatchEvent(new CustomEvent('heartmula_progress', { detail: data }));
         }
+
+        if (type === 'startup_progress') {
+          setStartupStatus(data);
+          if (data.status === 'ready') {
+            setIsStartupComplete(true);
+            // Reload GPU info and settings after startup completes
+            api.getGPUStatus().then(setGpuStatus).catch(() => {});
+            api.getGPUSettings().then(setGpuSettings).catch(() => {});
+            api.getLLMSettings().then(setLlmSettings).catch(() => {});
+          }
+        }
       } catch (err) {
         console.error("SSE Parse Error", err);
       }
@@ -245,7 +300,9 @@ function App() {
         // Experimental: Advanced reference audio options
         data.negativeTags,
         data.refAudioAsNoise,
-        data.refAudioNoiseStrength
+        data.refAudioNoiseStrength,
+        // User-defined title
+        data.title
       );
       setQueuedJobs(prev => {
         const next = new Map(prev);
@@ -318,6 +375,21 @@ function App() {
     }
   };
 
+  const handleDeleteJob = (jobId: string) => {
+    setQueuedJobs(prev => {
+      const next = new Map(prev);
+      next.delete(jobId);
+      // Renumber remaining jobs
+      let pos = 1;
+      const entries = Array.from(next.entries());
+      next.clear();
+      for (const [id] of entries) {
+        next.set(id, pos++);
+      }
+      return next;
+    });
+  };
+
   const handlePlayTrack = (job: Job) => {
     if (job.status === 'completed' && job.audio_path) {
       setPlayingTrack(job);
@@ -348,6 +420,33 @@ function App() {
     { id: 'favourites' as const, label: 'Favourites', icon: Heart },
     { id: 'playlists' as const, label: 'Playlists', icon: ListMusic },
   ];
+
+  // Settings handlers
+  const handleSaveSettings = async (settings: GPUSettings) => {
+    const updated = await api.updateGPUSettings(settings);
+    setGpuSettings(updated);
+  };
+
+  const handleReloadModels = async (settings: GPUSettings) => {
+    await api.reloadModels(settings);
+    // Progress will be tracked via SSE events
+  };
+
+  const handleSaveLLMSettings = async (settings: { ollama_host?: string; openrouter_api_key?: string }) => {
+    const updated = await api.updateLLMSettings(settings);
+    setLlmSettings(updated);
+  };
+
+  // Show startup screen until ready
+  if (!isStartupComplete) {
+    return (
+      <StartupScreen
+        status={startupStatus}
+        darkMode={darkMode}
+        gpuStatus={gpuStatus}
+      />
+    );
+  }
 
   return (
     <div className={`h-screen w-full flex flex-col overflow-hidden font-sans transition-colors duration-300 ${darkMode ? 'bg-[#121212] text-white' : 'bg-slate-50 text-slate-900'}`}>
@@ -394,14 +493,23 @@ function App() {
           })}
         </nav>
 
-        {/* Right: Dark Mode Toggle */}
-        <button
-          onClick={() => setDarkMode(!darkMode)}
-          className={`p-2 rounded-full transition-all ${darkMode ? 'bg-[#282828] hover:bg-[#3E3E3E] text-[#1DB954]' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}`}
-          title={darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-        >
-          {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-        </button>
+        {/* Right: Settings & Dark Mode Toggle */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setSettingsModalOpen(true)}
+            className={`p-2 rounded-full transition-all ${darkMode ? 'hover:bg-[#282828] text-[#b3b3b3] hover:text-white' : 'hover:bg-slate-100 text-slate-500'}`}
+            title="Settings"
+          >
+            <Settings className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => setDarkMode(!darkMode)}
+            className={`p-2 rounded-full transition-all ${darkMode ? 'bg-[#282828] hover:bg-[#3E3E3E] text-[#1DB954]' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}`}
+            title={darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+          >
+            {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
+        </div>
       </header>
 
       {/* Main Layout */}
@@ -512,6 +620,7 @@ function App() {
               onExtend={handleExtendJob}
               onReimport={handleReimportJob}
               onRetry={handleRetryJob}
+              onDeleteJob={handleDeleteJob}
               onPlayTrack={handlePlayTrack}
               onPauseTrack={() => setPauseTrigger(p => p + 1)}
               playingTrackId={playingTrack?.id}
@@ -621,6 +730,20 @@ function App() {
         onClose={() => setPlaylistModalSong(null)}
         song={playlistModalSong}
         darkMode={darkMode}
+      />
+
+      {/* Settings Modal */}
+      <SettingsModal
+        isOpen={settingsModalOpen}
+        onClose={() => setSettingsModalOpen(false)}
+        darkMode={darkMode}
+        gpuStatus={gpuStatus}
+        currentSettings={gpuSettings}
+        onSave={handleSaveSettings}
+        onReload={handleReloadModels}
+        startupStatus={startupStatus}
+        llmSettings={llmSettings}
+        onSaveLLM={handleSaveLLMSettings}
       />
     </div>
   );

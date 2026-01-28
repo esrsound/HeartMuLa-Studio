@@ -21,7 +21,7 @@ export interface Job {
 export interface LLMModel {
     id: string;
     name: string;
-    provider: 'ollama' | 'openrouter';
+    provider: 'ollama' | 'openrouter' | 'custom';
 }
 
 export interface Playlist {
@@ -40,6 +40,47 @@ export interface PlaylistWithSongs extends Playlist {
         position: number;
         added_at: string;
     }[];
+}
+
+export interface StartupStatus {
+    status: 'not_started' | 'downloading' | 'loading' | 'ready' | 'error';
+    progress: number;
+    message: string;
+    error?: string | null;
+    ready: boolean;
+}
+
+export interface GPUInfo {
+    index: number;
+    name: string;
+    vram_gb: number;
+    compute_capability: number;
+    supports_flash_attention: boolean;
+}
+
+export interface GPUStatus {
+    cuda_available: boolean;
+    num_gpus: number;
+    gpus: GPUInfo[];
+    total_vram_gb: number;
+}
+
+export interface GPUSettings {
+    quantization_4bit: string;
+    sequential_offload: string;
+    torch_compile: boolean;
+    torch_compile_mode: string;
+}
+
+export interface LLMSettings {
+    ollama_host: string;
+    openrouter_api_key: string;
+    ollama_available: boolean;
+    openrouter_available: boolean;
+    custom_api_base_url: string;
+    custom_api_key: string;
+    custom_api_model: string;
+    custom_api_available: boolean;
 }
 
 export const api = {
@@ -71,7 +112,8 @@ export const api = {
         refAudioStartSec?: number,
         negativeTags?: string,
         refAudioAsNoise?: boolean,
-        refAudioNoiseStrength?: number
+        refAudioNoiseStrength?: number,
+        title?: string
     ) => {
         const res = await axios.post(`${API_BASE_URL}/generate/music`, {
             prompt,
@@ -87,7 +129,9 @@ export const api = {
             // Experimental: Advanced reference audio options
             negative_tags: negativeTags,
             ref_audio_as_noise: refAudioAsNoise,
-            ref_audio_noise_strength: refAudioNoiseStrength
+            ref_audio_noise_strength: refAudioNoiseStrength,
+            // User-defined title
+            title
         });
         return res.data;
     },
@@ -214,6 +258,7 @@ export const api = {
         eventSource.addEventListener("job_progress", onMessage);
         eventSource.addEventListener("job_queued", onMessage);
         eventSource.addEventListener("job_queue", onMessage);
+        eventSource.addEventListener("startup_progress", onMessage);
 
         return eventSource;
     },
@@ -274,6 +319,51 @@ export const api = {
 
     removeSongFromPlaylist: async (playlistId: string, jobId: string) => {
         const res = await axios.delete(`${API_BASE_URL}/playlists/${playlistId}/songs/${jobId}`);
+        return res.data;
+    },
+
+    // ============== STARTUP & SETTINGS ==============
+
+    getStartupStatus: async (): Promise<StartupStatus> => {
+        const res = await axios.get(`${API_BASE_URL}/settings/startup/status`);
+        return res.data;
+    },
+
+    getGPUStatus: async (): Promise<GPUStatus> => {
+        const res = await axios.get(`${API_BASE_URL}/settings/gpu/status`);
+        return res.data;
+    },
+
+    getGPUSettings: async (): Promise<GPUSettings> => {
+        const res = await axios.get(`${API_BASE_URL}/settings/gpu`);
+        return res.data;
+    },
+
+    updateGPUSettings: async (settings: Partial<GPUSettings>): Promise<GPUSettings> => {
+        const res = await axios.put(`${API_BASE_URL}/settings/gpu`, settings);
+        return res.data;
+    },
+
+    reloadModels: async (settings: Partial<GPUSettings>): Promise<{ status: string; message: string }> => {
+        const res = await axios.post(`${API_BASE_URL}/settings/gpu/reload`, settings);
+        return res.data;
+    },
+
+    // ============== LLM SETTINGS ==============
+
+    getLLMSettings: async (): Promise<LLMSettings> => {
+        const res = await axios.get(`${API_BASE_URL}/settings/llm`);
+        return res.data;
+    },
+
+    updateLLMSettings: async (settings: {
+        ollama_host?: string;
+        openrouter_api_key?: string;
+        custom_api_base_url?: string;
+        custom_api_key?: string;
+        custom_api_model?: string;
+    }): Promise<LLMSettings> => {
+        const res = await axios.put(`${API_BASE_URL}/settings/llm`, settings);
         return res.data;
     }
 };

@@ -1,7 +1,9 @@
 import asyncio
 import os
 import gc
+import json
 import torch
+import torch._dynamo
 import torchaudio
 import logging
 from typing import Optional, Callable, Union, Dict
@@ -70,6 +72,10 @@ VRAM_MINIMUM = 8.0  # Absolute minimum to run at all
 # Allows users to point to existing models (e.g., ComfyUI shared models)
 _default_model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
 DEFAULT_MODEL_DIR = os.environ.get("HEARTMULA_MODEL_DIR", _default_model_dir)
+
+# Settings persistence file - in db directory which is mounted as a volume
+_default_db_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "db")
+SETTINGS_FILE = os.path.join(os.environ.get("HEARTMULA_DB_PATH", _default_db_dir).replace("jobs.db", ""), "settings.json")
 
 
 def detect_optimal_gpu_config() -> dict:
@@ -350,26 +356,49 @@ def ensure_models_downloaded(model_dir: str = DEFAULT_MODEL_DIR, version: str = 
 def apply_torch_compile(model, compile_mode: str = "default"):
     """
     Apply torch.compile to HeartMuLa model for faster inference.
-    
+
     This can provide ~2x speedup on supported GPUs (tested on RTX 4090, A100).
     First run will be slower due to compilation, but subsequent runs are faster.
-    
+
+    Requirements:
+    - Turing (SM 7.5) or newer GPU recommended
+    - Triton with inductor backend for best performance
+
     Args:
         model: HeartMuLa model instance
         compile_mode: One of "default", "reduce-overhead", or "max-autotune"
-    
+
     Returns:
         The compiled model, or original model if compilation fails
     """
     if not ENABLE_TORCH_COMPILE:
         return model
-    
+
+    # Check GPU compute capability - torch.compile with Triton works best on SM 7.5+
+    # Older GPUs (Pascal SM 6.x, Volta SM 7.0) may have issues or be very slow
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        compute_cap = props.major + props.minor / 10
+        if compute_cap < 7.5:
+            print(f"[torch.compile] WARNING: GPU {props.name} (SM {compute_cap}) is older than recommended.", flush=True)
+            print(f"[torch.compile] torch.compile works best on Turing (SM 7.5) or newer GPUs.", flush=True)
+            print(f"[torch.compile] On older GPUs, compilation can be very slow or may fail.", flush=True)
+            print(f"[torch.compile] Auto-disabling torch.compile for better stability.", flush=True)
+            return model
+
     try:
         # Check if triton is available for optimal performance
         try:
             import triton
+            # Test if triton can actually compile (needs C compiler)
+            import subprocess
+            result = subprocess.run(['which', 'gcc'], capture_output=True)
+            if result.returncode != 0:
+                result = subprocess.run(['which', 'cc'], capture_output=True)
+            if result.returncode != 0:
+                raise RuntimeError("No C compiler found (gcc/cc). Triton inductor backend requires a C compiler.")
             backend = "inductor"
-            print(f"[torch.compile] Triton found - using inductor backend for optimal performance", flush=True)
+            print(f"[torch.compile] Triton found with C compiler - using inductor backend", flush=True)
         except ImportError:
             import warnings
             warnings.warn(
@@ -378,10 +407,16 @@ def apply_torch_compile(model, compile_mode: str = "default"):
             )
             backend = "eager"
             print(f"[torch.compile] Triton not found - using eager backend (slower)", flush=True)
-        
+        except RuntimeError as e:
+            print(f"[torch.compile] {e} Falling back to eager backend.", flush=True)
+            backend = "eager"
+
         print(f"[torch.compile] Compiling HeartMuLa model (mode={compile_mode}, backend={backend})...", flush=True)
         print(f"[torch.compile] Note: First generation will be slower due to compilation.", flush=True)
-        
+
+        # Suppress errors and fall back to eager if compilation fails at runtime
+        torch._dynamo.config.suppress_errors = True
+
         # Compile backbone and decoder
         model.backbone = torch.compile(
             model.backbone,
@@ -395,10 +430,10 @@ def apply_torch_compile(model, compile_mode: str = "default"):
             mode=compile_mode,
             dynamic=True,
         )
-        
+
         print(f"[torch.compile] Model compiled successfully!", flush=True)
         return model
-        
+
     except Exception as e:
         import warnings
         warnings.warn(f"torch.compile failed ({e}), continuing without compilation")
@@ -811,7 +846,98 @@ class MusicService:
             cls._instance.active_jobs = {}  # Map job_id -> threading.Event
             cls._instance.gpu_mode = "single"
             cls._instance.job_queue = []  # List of job_ids waiting in queue
+            # Startup progress tracking
+            cls._instance.startup_status = "not_started"  # not_started, downloading, loading, ready, error
+            cls._instance.startup_progress = 0
+            cls._instance.startup_message = ""
+            cls._instance.startup_error = None
+            # torch.compile first run tracking
+            cls._instance._torch_compile_first_run = True
+            # Current settings (for display in settings panel)
+            cls._instance.current_settings = {
+                "quantization_4bit": "auto",
+                "sequential_offload": "auto",
+                "torch_compile": False,
+                "torch_compile_mode": "default",
+                # LLM Provider settings
+                "ollama_host": "",
+                "openrouter_api_key": "",
+                # Custom API settings
+                "custom_api_base_url": "",
+                "custom_api_key": "",
+                "custom_api_model": ""
+            }
+            # Load persisted settings from disk (overrides defaults)
+            cls._instance._load_settings()
         return cls._instance
+
+    def _load_settings(self):
+        """Load settings from persistent storage and apply to global variables."""
+        global ENABLE_4BIT_QUANTIZATION, ENABLE_SEQUENTIAL_OFFLOAD, ENABLE_TORCH_COMPILE, TORCH_COMPILE_MODE
+        global _4BIT_ENV, _OFFLOAD_ENV, _COMPILE_ENV, _COMPILE_MODE_ENV
+
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, 'r') as f:
+                    saved = json.load(f)
+                    # Only update keys that exist in defaults
+                    for key in self.current_settings:
+                        if key in saved:
+                            self.current_settings[key] = saved[key]
+
+                    # Apply loaded settings to global variables
+                    if "quantization_4bit" in saved:
+                        val = saved["quantization_4bit"]
+                        _4BIT_ENV = val
+                        if val == "auto":
+                            ENABLE_4BIT_QUANTIZATION = None
+                        else:
+                            ENABLE_4BIT_QUANTIZATION = val == "true"
+
+                    if "sequential_offload" in saved:
+                        val = saved["sequential_offload"]
+                        _OFFLOAD_ENV = val
+                        if val == "auto":
+                            ENABLE_SEQUENTIAL_OFFLOAD = None
+                        else:
+                            ENABLE_SEQUENTIAL_OFFLOAD = val == "true"
+
+                    if "torch_compile" in saved:
+                        ENABLE_TORCH_COMPILE = saved["torch_compile"]
+                        _COMPILE_ENV = "true" if saved["torch_compile"] else "false"
+
+                    if "torch_compile_mode" in saved:
+                        TORCH_COMPILE_MODE = saved["torch_compile_mode"]
+                        _COMPILE_MODE_ENV = saved["torch_compile_mode"]
+
+                    # Apply LLM settings
+                    from backend.app.services.llm_service import LLMService
+                    if "ollama_host" in saved and saved["ollama_host"]:
+                        LLMService.update_settings(ollama_host=saved["ollama_host"])
+                    if "openrouter_api_key" in saved and saved["openrouter_api_key"]:
+                        LLMService.update_settings(openrouter_api_key=saved["openrouter_api_key"])
+                    # Apply Custom API settings
+                    if "custom_api_base_url" in saved:
+                        LLMService.update_settings(custom_api_base_url=saved["custom_api_base_url"])
+                    if "custom_api_key" in saved:
+                        LLMService.update_settings(custom_api_key=saved["custom_api_key"])
+                    if "custom_api_model" in saved:
+                        LLMService.update_settings(custom_api_model=saved["custom_api_model"])
+
+                    logger.info(f"[Settings] Loaded from {SETTINGS_FILE}: {self.current_settings}")
+        except Exception as e:
+            logger.warning(f"[Settings] Failed to load settings: {e}")
+
+    def _save_settings(self):
+        """Save settings to persistent storage."""
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(self.current_settings, f, indent=2)
+            logger.info(f"[Settings] Saved to {SETTINGS_FILE}")
+        except Exception as e:
+            logger.warning(f"[Settings] Failed to save settings: {e}")
 
     def get_queue_position(self, job_id: str) -> int:
         """Returns 1-based position in queue, or 0 if not in queue."""
@@ -824,6 +950,281 @@ class MusicService:
         """Notify all queued jobs of their current position."""
         for i, jid in enumerate(self.job_queue):
             event_manager.publish("job_queue", {"job_id": str(jid), "position": i + 1, "total": len(self.job_queue)})
+
+    def _emit_startup_progress(self, status: str, progress: int, message: str, error: str = None):
+        """Emit startup progress via SSE."""
+        self.startup_status = status
+        self.startup_progress = progress
+        self.startup_message = message
+        self.startup_error = error
+        event_manager.publish("startup_progress", {
+            "status": status,
+            "progress": progress,
+            "message": message,
+            "error": error,
+            "ready": status == "ready"
+        })
+        print(f"[Startup] {status}: {progress}% - {message}", flush=True)
+
+    def get_startup_status(self) -> dict:
+        """Get current startup status."""
+        return {
+            "status": self.startup_status,
+            "progress": self.startup_progress,
+            "message": self.startup_message,
+            "error": self.startup_error,
+            "ready": self.startup_status == "ready"
+        }
+
+    async def _download_models_with_progress(self, model_dir: str, version: str) -> str:
+        """Download models with progress callbacks."""
+        from huggingface_hub import snapshot_download, hf_hub_download
+
+        os.makedirs(model_dir, exist_ok=True)
+
+        # Get HuggingFace repo ID and local folder name for this version
+        if version in MODEL_VERSIONS:
+            hf_repo, folder_name = MODEL_VERSIONS[version]
+        else:
+            hf_repo = f"HeartMuLa/HeartMuLa-oss-{version}"
+            folder_name = f"HeartMuLa-oss-{version}"
+
+        heartmula_path = os.path.join(model_dir, folder_name)
+        heartcodec_path = os.path.join(model_dir, "HeartCodec-oss")
+        tokenizer_path = os.path.join(model_dir, "tokenizer.json")
+        gen_config_path = os.path.join(model_dir, "gen_config.json")
+
+        all_present = (
+            os.path.exists(heartmula_path) and
+            os.path.exists(heartcodec_path) and
+            os.path.isfile(tokenizer_path) and
+            os.path.isfile(gen_config_path)
+        )
+
+        if all_present:
+            self._emit_startup_progress("downloading", 40, "All models found locally")
+            return model_dir
+
+        loop = asyncio.get_running_loop()
+
+        # Download HeartMuLa model
+        if not os.path.exists(heartmula_path):
+            self._emit_startup_progress("downloading", 10, f"Downloading {folder_name} (~3GB)...")
+            await loop.run_in_executor(
+                None,
+                lambda: snapshot_download(
+                    repo_id=hf_repo,
+                    local_dir=heartmula_path,
+                    local_dir_use_symlinks=False,
+                )
+            )
+            self._emit_startup_progress("downloading", 28, f"{folder_name} downloaded")
+
+        # Download HeartCodec model
+        if not os.path.exists(heartcodec_path):
+            self._emit_startup_progress("downloading", 30, "Downloading HeartCodec (~1.5GB)...")
+            await loop.run_in_executor(
+                None,
+                lambda: snapshot_download(
+                    repo_id=HF_HEARTCODEC_REPO,
+                    local_dir=heartcodec_path,
+                    local_dir_use_symlinks=False,
+                )
+            )
+            self._emit_startup_progress("downloading", 38, "HeartCodec downloaded")
+
+        # Download tokenizer and gen_config
+        if not os.path.isfile(tokenizer_path):
+            self._emit_startup_progress("downloading", 39, "Downloading tokenizer...")
+            await loop.run_in_executor(
+                None,
+                lambda: hf_hub_download(
+                    repo_id=HF_HEARTMULA_GEN_REPO,
+                    filename="tokenizer.json",
+                    local_dir=model_dir,
+                    local_dir_use_symlinks=False,
+                )
+            )
+
+        if not os.path.isfile(gen_config_path):
+            await loop.run_in_executor(
+                None,
+                lambda: hf_hub_download(
+                    repo_id=HF_HEARTMULA_GEN_REPO,
+                    filename="gen_config.json",
+                    local_dir=model_dir,
+                    local_dir_use_symlinks=False,
+                )
+            )
+
+        self._emit_startup_progress("downloading", 40, "All models downloaded")
+        return model_dir
+
+    async def initialize_with_progress(self, model_path: Optional[str] = None, version: str = None):
+        """Initialize models with progress events for frontend display."""
+        if self.pipeline is not None or self.is_loading:
+            if self.pipeline is not None:
+                self._emit_startup_progress("ready", 100, "Ready!")
+            return
+
+        self.is_loading = True
+
+        try:
+            # Use default version if not specified
+            if version is None:
+                version = DEFAULT_VERSION
+
+            self._emit_startup_progress("downloading", 0, "Checking models...")
+
+            # Clean up GPU memory
+            self._emit_startup_progress("downloading", 5, "Preparing GPU...")
+            cleanup_gpu_memory()
+
+            # Download models with progress
+            if model_path is None:
+                model_path = await self._download_models_with_progress(DEFAULT_MODEL_DIR, version)
+
+            # Load models
+            self._emit_startup_progress("loading", 45, "Loading HeartMuLa model...")
+
+            loop = asyncio.get_running_loop()
+
+            # Store settings being used (preserve LLM settings)
+            self.current_settings.update({
+                "quantization_4bit": _4BIT_ENV,
+                "sequential_offload": _OFFLOAD_ENV,
+                "torch_compile": ENABLE_TORCH_COMPILE,
+                "torch_compile_mode": TORCH_COMPILE_MODE
+            })
+
+            self.pipeline = await loop.run_in_executor(
+                None,
+                lambda mp=model_path, v=version: self._load_pipeline_multi_gpu(mp, v)
+            )
+
+            self._emit_startup_progress("loading", 95, "Initializing pipeline...")
+
+            self._emit_startup_progress("ready", 100, "Ready!")
+            logger.info(f"Heartlib model loaded successfully in {self.gpu_mode}-GPU mode.")
+
+            # Save settings to disk after successful initialization
+            self._save_settings()
+
+        except Exception as e:
+            logger.error(f"Failed to load Heartlib model: {e}")
+            self._emit_startup_progress("error", 0, f"Failed to load model: {str(e)}", str(e))
+            raise e
+        finally:
+            self.is_loading = False
+
+    def _unload_all_models(self):
+        """Unload all models and free GPU memory."""
+        logger.info("Unloading all models...")
+        if self.pipeline is not None:
+            # Unload HeartMuLa
+            if hasattr(self.pipeline, '_mula') and self.pipeline._mula is not None:
+                del self.pipeline._mula
+            # Unload HeartCodec
+            if hasattr(self.pipeline, '_codec') and self.pipeline._codec is not None:
+                del self.pipeline._codec
+            del self.pipeline
+            self.pipeline = None
+
+        # Aggressive memory cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+        logger.info("All models unloaded")
+
+    def get_gpu_info(self) -> dict:
+        """Get GPU hardware information."""
+        result = {
+            "cuda_available": torch.cuda.is_available(),
+            "num_gpus": 0,
+            "gpus": [],
+            "total_vram_gb": 0
+        }
+
+        if not torch.cuda.is_available():
+            return result
+
+        num_gpus = torch.cuda.device_count()
+        result["num_gpus"] = num_gpus
+
+        total_vram = 0
+        for i in range(num_gpus):
+            props = torch.cuda.get_device_properties(i)
+            vram_gb = props.total_memory / (1024 ** 3)
+            compute_cap = props.major + props.minor / 10
+            gpu_info = {
+                "index": i,
+                "name": props.name,
+                "vram_gb": round(vram_gb, 1),
+                "compute_capability": compute_cap,
+                "supports_flash_attention": compute_cap >= 7.0
+            }
+            result["gpus"].append(gpu_info)
+            total_vram += vram_gb
+
+        result["total_vram_gb"] = round(total_vram, 1)
+        return result
+
+    async def reload_models(self, settings: dict):
+        """Reload models with new settings."""
+        # Check if a job is currently processing
+        if len(self.active_jobs) > 0:
+            raise RuntimeError("Cannot reload models while a job is processing")
+
+        if len(self.job_queue) > 0:
+            raise RuntimeError("Cannot reload models while jobs are queued")
+
+        logger.info(f"Reloading models with settings: {settings}")
+
+        # Emit reload started event
+        self._emit_startup_progress("loading", 0, "Reloading models...")
+
+        # Apply new settings as environment variables (for next load)
+        global ENABLE_4BIT_QUANTIZATION, ENABLE_SEQUENTIAL_OFFLOAD, ENABLE_TORCH_COMPILE, TORCH_COMPILE_MODE
+        global _4BIT_ENV, _OFFLOAD_ENV, _COMPILE_ENV, _COMPILE_MODE_ENV
+
+        if "quantization_4bit" in settings:
+            val = settings["quantization_4bit"]
+            _4BIT_ENV = val
+            if val == "auto":
+                ENABLE_4BIT_QUANTIZATION = None
+            else:
+                ENABLE_4BIT_QUANTIZATION = val == "true"
+
+        if "sequential_offload" in settings:
+            val = settings["sequential_offload"]
+            _OFFLOAD_ENV = val
+            if val == "auto":
+                ENABLE_SEQUENTIAL_OFFLOAD = None
+            else:
+                ENABLE_SEQUENTIAL_OFFLOAD = val == "true"
+
+        if "torch_compile" in settings:
+            ENABLE_TORCH_COMPILE = settings["torch_compile"]
+            _COMPILE_ENV = "true" if settings["torch_compile"] else "false"
+
+        if "torch_compile_mode" in settings:
+            TORCH_COMPILE_MODE = settings["torch_compile_mode"]
+            _COMPILE_MODE_ENV = settings["torch_compile_mode"]
+
+        # Reset first run flag when torch.compile setting changes
+        if "torch_compile" in settings:
+            self._torch_compile_first_run = settings["torch_compile"]
+
+        # Unload current models
+        self._emit_startup_progress("loading", 10, "Unloading current models...")
+        self._unload_all_models()
+
+        # Reinitialize with new settings
+        await self.initialize_with_progress()
 
     def _load_pipeline_multi_gpu(self, model_path: str, version: str):
         """Load pipeline with multi-GPU support and automatic VRAM-based configuration."""
@@ -1163,36 +1564,70 @@ class MusicService:
                 abort_event = threading.Event()
                 self.active_jobs[job_id_str] = abort_event
 
-                # 4. Generate Auto-Title (Robust)
+                # 4. Generate Title (User-provided > Lyrics extraction > LLM)
                 from backend.app.services.llm_service import LLMService
-
-                # Use lyrics for context if available, otherwise prompt
-                context_source = request.lyrics if request.lyrics and len(request.lyrics) > 10 else request.prompt
-                # Truncate to first 1000 chars to avoid token limits, but enough for context
-                context_source = context_source[:1000]
+                import re
 
                 auto_title = "Untitled Track"
-                try:
-                    # Logic: If no model is specified, find what's running locally
-                    model_to_use = request.llm_model
-                    provider_to_use = "ollama"
-                    if not model_to_use:
-                        try:
-                            models = LLMService.get_models()
-                            if models:
-                                model_to_use = models[0]["id"]
-                                provider_to_use = models[0]["provider"]
-                                logger.info(f"No specific LLM model requested. Using: {model_to_use} ({provider_to_use})")
-                            else:
-                                model_to_use = "llama3"
-                                logger.warning("No specific LLM model requested and no local models found. Defaulting to 'llama3'.")
-                        except Exception as e:
-                            model_to_use = "llama3"
-                            logger.warning(f"Error fetching local models: {e}. Fallback to 'llama3'.")
 
-                    auto_title = LLMService.generate_title(context_source, model=model_to_use, provider=provider_to_use)
-                except Exception as e:
-                    logger.warning(f"Auto-title generation failed: {e}. Using default.")
+                # Priority 1: User-provided title
+                if request.title and request.title.strip():
+                    auto_title = request.title.strip()
+                    logger.info(f"Using user-provided title: {auto_title}")
+                else:
+                    # Priority 2: Extract from lyrics (first meaningful line, excluding markers)
+                    if request.lyrics and len(request.lyrics) > 5:
+                        # Split lyrics into lines and find first non-marker line
+                        lines = request.lyrics.strip().split('\n')
+                        marker_pattern = re.compile(r'^\s*\[.*\]\s*$|^\s*\(.*\)\s*$', re.IGNORECASE)
+                        section_words = {'intro', 'verse', 'chorus', 'bridge', 'outro', 'hook', 'pre-chorus', 'interlude', 'break'}
+
+                        for line in lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            # Skip lines that are just markers like [Intro], [Verse 1], (Chorus), etc.
+                            if marker_pattern.match(line):
+                                continue
+                            # Skip lines that are just section words
+                            if line.lower().replace('[', '').replace(']', '').strip() in section_words:
+                                continue
+                            # Found a meaningful line - use first 50 chars as title
+                            extracted_title = line[:50].strip()
+                            if len(line) > 50:
+                                extracted_title = extracted_title.rsplit(' ', 1)[0] + '...'
+                            auto_title = extracted_title
+                            logger.info(f"Extracted title from lyrics: {auto_title}")
+                            break
+
+                    # Priority 3: LLM generation (only if we still have default title)
+                    if auto_title == "Untitled Track":
+                        try:
+                            # Use lyrics for context if available, otherwise prompt
+                            context_source = request.lyrics if request.lyrics and len(request.lyrics) > 10 else request.prompt
+                            # Truncate to first 1000 chars to avoid token limits, but enough for context
+                            context_source = context_source[:1000]
+
+                            # Logic: If no model is specified, find what's running locally
+                            model_to_use = request.llm_model
+                            provider_to_use = "ollama"
+                            if not model_to_use:
+                                try:
+                                    models = LLMService.get_models()
+                                    if models:
+                                        model_to_use = models[0]["id"]
+                                        provider_to_use = models[0]["provider"]
+                                        logger.info(f"No specific LLM model requested. Using: {model_to_use} ({provider_to_use})")
+                                    else:
+                                        model_to_use = "llama3"
+                                        logger.warning("No specific LLM model requested and no local models found. Defaulting to 'llama3'.")
+                                except Exception as e:
+                                    model_to_use = "llama3"
+                                    logger.warning(f"Error fetching local models: {e}. Fallback to 'llama3'.")
+
+                            auto_title = LLMService.generate_title(context_source, model=model_to_use, provider=provider_to_use)
+                        except Exception as e:
+                            logger.warning(f"Auto-title generation failed: {e}. Using default.")
 
                 # 5. Run Generation (Blocking, run in executor)
 
@@ -1285,9 +1720,51 @@ class MusicService:
 
                 # Notify Start
                 event_manager.publish("job_update", {"job_id": job_id_str, "status": "processing"})
-                event_manager.publish("job_progress", {"job_id": job_id_str, "progress": 0, "msg": "Starting generation pipeline..."})
+
+                # Check if torch.compile is enabled and this is first run
+                is_compiling_first_run = ENABLE_TORCH_COMPILE and self._torch_compile_first_run
+                compile_timer_stop = None
+
+                if is_compiling_first_run:
+                    event_manager.publish("job_progress", {
+                        "job_id": job_id_str,
+                        "progress": 0,
+                        "msg": "Compiling model (first run only)... 0:00 elapsed"
+                    })
+
+                    # Start a background task to update elapsed time during compilation
+                    compile_start_time = time.time()
+                    compile_timer_stop = asyncio.Event()
+
+                    async def update_compile_progress():
+                        while not compile_timer_stop.is_set():
+                            elapsed = int(time.time() - compile_start_time)
+                            mins, secs = divmod(elapsed, 60)
+                            event_manager.publish("job_progress", {
+                                "job_id": job_id_str,
+                                "progress": 0,
+                                "msg": f"Compiling model (first run only)... {mins}:{secs:02d} elapsed"
+                            })
+                            try:
+                                await asyncio.wait_for(compile_timer_stop.wait(), timeout=5.0)
+                                break
+                            except asyncio.TimeoutError:
+                                pass
+
+                    compile_timer_task = asyncio.create_task(update_compile_progress())
+                else:
+                    event_manager.publish("job_progress", {"job_id": job_id_str, "progress": 0, "msg": "Starting generation pipeline..."})
 
                 await loop.run_in_executor(None, _run_pipeline)
+
+                # Stop compile timer if it was running
+                if compile_timer_stop:
+                    compile_timer_stop.set()
+                    await compile_timer_task
+
+                # Mark first run complete
+                if is_compiling_first_run:
+                    self._torch_compile_first_run = False
 
                 # 6. Update status to COMPLETED
                 generation_time = time.time() - generation_start_time
